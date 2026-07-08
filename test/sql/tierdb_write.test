@@ -1,0 +1,138 @@
+# name: test/sql/tierdb_write.test
+# description: INSERT/UPDATE/DELETE routing across the seam, retention guard, mirrored mode.
+# group: [tierdb]
+
+require tierdb
+
+require-env TIERDB_TEST_DSN
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS pg (TYPE postgres);
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS tdb (TYPE tierdb);
+
+# INSERT: hot -> heap, cold -> delta (op=0)
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.cutline SET tier_key_hi = 100, retention_line = NULL WHERE table_id = 90001; UPDATE tierdb.tables SET mode = ''tiered'', keep_heap = false, heap_retention_lag = NULL WHERE table_id = 90001');
+
+statement ok
+INSERT INTO tdb.public.events VALUES (10, 150, 'hot-insert');
+
+statement ok
+INSERT INTO tdb.public.events VALUES (11, 60, 'cold-insert');
+
+query IIT
+SELECT id, event_time, val FROM pg.public.events ORDER BY id;
+----
+10	150	hot-insert
+
+query TII
+SELECT pk, op, tier_key FROM pg.tierdb.delta WHERE table_id = 90001 ORDER BY pk;
+----
+11	0	60
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+1	50	lake-1
+4	80	lake-4-original
+10	150	hot-insert
+11	60	cold-insert
+
+# cold write below the retention line is rejected
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.cutline SET retention_line = 40 WHERE table_id = 90001');
+
+statement error
+INSERT INTO tdb.public.events VALUES (12, 30, 'too-old');
+----
+below the retention line
+
+statement ok
+CALL postgres_execute('pg', 'UPDATE tierdb.cutline SET retention_line = NULL WHERE table_id = 90001');
+
+# UPDATE: hot row updated in heap, cold row becomes delta op=0
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; INSERT INTO public.events VALUES (10, 150, ''hot-row'')');
+
+statement ok
+UPDATE tdb.public.events SET val = 'hot-updated' WHERE id = 10;
+
+statement ok
+UPDATE tdb.public.events SET val = 'cold-updated' WHERE id = 4;
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+1	50	lake-1
+4	80	cold-updated
+10	150	hot-updated
+
+query IIT
+SELECT id, event_time, val FROM pg.public.events ORDER BY id;
+----
+10	150	hot-updated
+
+query TII
+SELECT pk, op, tier_key FROM pg.tierdb.delta WHERE table_id = 90001 ORDER BY pk;
+----
+4	0	80
+
+# DELETE: hot row removed from heap, cold row tombstoned
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; INSERT INTO public.events VALUES (10, 150, ''hot-row'')');
+
+statement ok
+DELETE FROM tdb.public.events WHERE id = 10;
+
+statement ok
+DELETE FROM tdb.public.events WHERE id = 1;
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+4	80	lake-4-original
+
+query I
+SELECT count(*) FROM pg.public.events;
+----
+0
+
+query TII
+SELECT pk, op, tier_key FROM pg.tierdb.delta WHERE table_id = 90001 ORDER BY pk;
+----
+1	1	50
+
+# cold delete below the retention line is rejected
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.cutline SET retention_line = 60 WHERE table_id = 90001');
+
+statement error
+DELETE FROM tdb.public.events WHERE id = 1;
+----
+below the retention line
+
+statement ok
+CALL postgres_execute('pg', 'UPDATE tierdb.cutline SET retention_line = NULL WHERE table_id = 90001');
+
+# mirrored mode: every write lands in the heap, nothing in delta
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.tables SET mode = ''mirrored'', keep_heap = false, heap_retention_lag = NULL WHERE table_id = 90001');
+
+statement ok
+INSERT INTO tdb.public.events VALUES (20, 150, 'm-hot'), (21, 60, 'm-cold');
+
+query IIT
+SELECT id, event_time, val FROM pg.public.events ORDER BY id;
+----
+20	150	m-hot
+21	60	m-cold
+
+query I
+SELECT count(*) FROM pg.tierdb.delta WHERE table_id = 90001;
+----
+0
+
+statement ok
+CALL postgres_execute('pg', 'UPDATE tierdb.tables SET mode = ''tiered'', keep_heap = false, heap_retention_lag = NULL WHERE table_id = 90001; TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001');

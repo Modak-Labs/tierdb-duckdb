@@ -1,0 +1,10 @@
+build/
+.idea/
+cmake-build-*/
+duckdb_unittest_tempdir/
+.DS_Store
+testext
+.cache/
+test/python/__pycache__/
+tierdb-core-ffi/target/
+test/fixture/.lake/

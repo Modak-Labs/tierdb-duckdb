@@ -1,0 +1,72 @@
+# name: test/sql/tierdb_types.test
+# description: Column type round-trips across the hot heap and the cold delta overlay.
+# group: [tierdb]
+
+require tierdb
+
+require-env TIERDB_TEST_DSN
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS pg (TYPE postgres);
+
+# provision a rich-typed table (id 90002), cold tier = delta only, cutline T=100
+statement ok
+CALL postgres_execute('pg', 'DROP TABLE IF EXISTS public.types_t; CREATE TABLE public.types_t (id bigint PRIMARY KEY, tk bigint, c_text text, c_int integer, c_bool boolean, c_double double precision, c_numeric numeric(12,3), c_uuid uuid, c_date date, c_ts timestamp, c_tstz timestamptz, c_json jsonb, c_arr integer[], c_sarr text[]); DELETE FROM tierdb.tables WHERE table_id = 90002; INSERT INTO tierdb.tables (table_id, schema_name, table_name, primary_key_cols, tier_key_col, tier_key_type, partition_scheme, lake_format, lake_table_ref, mode) VALUES (90002, ''public'', ''types_t'', ARRAY[''id''], ''tk'', ''bigint'', ''{}''::jsonb, ''iceberg'', ''warehouse.public.types_t'', ''tiered''); DELETE FROM tierdb.cutline WHERE table_id = 90002; INSERT INTO tierdb.cutline (table_id, tier_key_hi, lake_snapshot_id, lake_props) VALUES (90002, 100, 1, jsonb_build_object())');
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS tdb (TYPE tierdb);
+
+# hot row (tk=150 -> heap) and cold row (tk=50 -> delta)
+statement ok
+INSERT INTO tdb.public.types_t VALUES (1, 150, 'hot', 42, true, 3.5, 12.345, '11111111-1111-1111-1111-111111111111', DATE '2021-01-02', TIMESTAMP '2021-01-02 03:04:05', TIMESTAMPTZ '2021-01-02 03:04:05+00', '{"k":1}', [1, 2, 3], ['a', 'b']);
+
+statement ok
+INSERT INTO tdb.public.types_t VALUES (2, 50, 'cold', 7, false, 6.25, 99.999, '22222222-2222-2222-2222-222222222222', DATE '2020-05-06', TIMESTAMP '2020-05-06 07:08:09', TIMESTAMPTZ '2020-05-06 07:08:09+00', '{"k":2}', [4, 5, 6], ['c']);
+
+# cast to text for a display-insensitive assertion; timestamptz needs icu to
+# render, so it is checked by equality below instead
+query TTTTTTTTTTTT
+SELECT id::varchar, c_text, c_int::varchar, c_bool::varchar, c_double::varchar,
+       c_numeric::varchar, c_uuid::varchar, c_date::varchar, c_ts::varchar,
+       c_arr::varchar, c_sarr::varchar, json_extract_string(c_json, 'k')
+FROM tdb.public.types_t ORDER BY id;
+----
+1	hot	42	true	3.5	12.345	11111111-1111-1111-1111-111111111111	2021-01-02	2021-01-02 03:04:05	[1, 2, 3]	[a, b]	1
+2	cold	7	false	6.25	99.999	22222222-2222-2222-2222-222222222222	2020-05-06	2020-05-06 07:08:09	[4, 5, 6]	[c]	2
+
+query I
+SELECT count(*) FROM tdb.public.types_t WHERE id = 1 AND c_tstz = TIMESTAMPTZ '2021-01-02 03:04:05+00';
+----
+1
+
+query I
+SELECT count(*) FROM tdb.public.types_t WHERE id = 2 AND c_tstz = TIMESTAMPTZ '2020-05-06 07:08:09+00';
+----
+1
+
+statement ok
+UPDATE tdb.public.types_t SET c_numeric = 1.250, c_arr = [9, 9], c_json = '{"k":42}' WHERE id = 1;
+
+statement ok
+UPDATE tdb.public.types_t SET c_numeric = 8.750, c_arr = [8], c_json = '{"k":43}' WHERE id = 2;
+
+query TTTT
+SELECT id::varchar, c_numeric::varchar, c_arr::varchar, json_extract_string(c_json, 'k')
+FROM tdb.public.types_t ORDER BY id;
+----
+1	1.250	[9, 9]	42
+2	8.750	[8]	43
+
+statement ok
+DELETE FROM tdb.public.types_t WHERE id = 1;
+
+statement ok
+DELETE FROM tdb.public.types_t WHERE id = 2;
+
+query I
+SELECT count(*) FROM tdb.public.types_t;
+----
+0
+
+statement ok
+CALL postgres_execute('pg', 'DROP TABLE IF EXISTS public.types_t; DELETE FROM tierdb.tables WHERE table_id = 90002');

@@ -1,0 +1,63 @@
+# name: test/sql/tierdb_read.test
+# description: Merged-read scenarios across the hot heap, cold lake, and delta overlay.
+# group: [tierdb]
+
+require tierdb
+
+require-env TIERDB_TEST_DSN
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS pg (TYPE postgres);
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS tdb (TYPE tierdb);
+
+# hot heap + cold lake, no delta
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.cutline SET tier_key_hi = 100 WHERE table_id = 90001; INSERT INTO public.events VALUES (2, 150, ''hot-seed''), (9, 200, ''hot-9'')');
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+1	50	lake-1
+2	150	hot-seed
+4	80	lake-4-original
+9	200	hot-9
+
+# delta upsert (op=0) overrides the lake row with the same pk
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; INSERT INTO tierdb.delta (table_id, pk, op, tier_key, version, payload) VALUES (90001, ''4'', 0, 80, 1, ''{"id":4,"event_time":80,"val":"delta-4-fixed"}'')');
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+1	50	lake-1
+4	80	delta-4-fixed
+
+# delta tombstone (op=1) hides the lake row
+statement ok
+CALL postgres_execute('pg', 'DELETE FROM tierdb.delta WHERE table_id = 90001; INSERT INTO tierdb.delta (table_id, pk, op, tier_key, version, payload) VALUES (90001, ''1'', 1, 50, 2, NULL)');
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+4	80	lake-4-original
+
+query I
+SELECT count(*) FROM tdb.public.events;
+----
+1
+
+# no lake snapshot committed: cold tier is delta-only (stash lake_props under a
+# nested key so metadata_location reads as absent, then restore it)
+statement ok
+CALL postgres_execute('pg', 'DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.cutline SET lake_props = jsonb_build_object(''_stash'', lake_props) WHERE table_id = 90001; TRUNCATE public.events; INSERT INTO public.events VALUES (2, 150, ''hot-seed''); INSERT INTO tierdb.delta (table_id, pk, op, tier_key, version, payload) VALUES (90001, ''5'', 0, 30, 3, ''{"id":5,"event_time":30,"val":"delta-only-5"}'')');
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+2	150	hot-seed
+5	30	delta-only-5
+
+statement ok
+CALL postgres_execute('pg', 'UPDATE tierdb.cutline SET lake_props = lake_props->''_stash'' WHERE table_id = 90001; DELETE FROM tierdb.delta WHERE table_id = 90001; TRUNCATE public.events');

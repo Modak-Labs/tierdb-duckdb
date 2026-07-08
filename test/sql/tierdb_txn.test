@@ -1,0 +1,80 @@
+# name: test/sql/tierdb_txn.test
+# description: Write atomicity across the DuckDB transaction boundary.
+# group: [tierdb]
+#
+# Reads run on a separate connection, so read-your-own-writes inside an explicit
+# transaction is not asserted; state is checked after the boundary via pg.
+
+require tierdb
+
+require-env TIERDB_TEST_DSN
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS pg (TYPE postgres);
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS tdb (TYPE tierdb);
+
+# ROLLBACK discards every write in the transaction
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.cutline SET tier_key_hi = 100, retention_line = NULL WHERE table_id = 90001; UPDATE tierdb.tables SET mode = ''tiered'', keep_heap = false, heap_retention_lag = NULL WHERE table_id = 90001');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO tdb.public.events VALUES (30, 150, 'tx-hot');
+
+statement ok
+INSERT INTO tdb.public.events VALUES (31, 60, 'tx-cold');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM pg.public.events;
+----
+0
+
+query I
+SELECT count(*) FROM pg.tierdb.delta WHERE table_id = 90001;
+----
+0
+
+# COMMIT persists the whole transaction: hot -> heap, cold -> delta
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO tdb.public.events VALUES (30, 150, 'tx-hot');
+
+statement ok
+INSERT INTO tdb.public.events VALUES (31, 60, 'tx-cold');
+
+statement ok
+COMMIT;
+
+query IIT
+SELECT id, event_time, val FROM pg.public.events ORDER BY id;
+----
+30	150	tx-hot
+
+query TII
+SELECT pk, op, tier_key FROM pg.tierdb.delta WHERE table_id = 90001 ORDER BY pk;
+----
+31	0	60
+
+# autocommit reads its own write: each statement is its own transaction
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001');
+
+statement ok
+INSERT INTO tdb.public.events VALUES (32, 150, 'auto-hot');
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events WHERE id = 32;
+----
+32	150	auto-hot
+
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001');

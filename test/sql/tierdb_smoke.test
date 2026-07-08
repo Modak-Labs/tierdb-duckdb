@@ -1,0 +1,28 @@
+# name: test/sql/tierdb_smoke.test
+# description: Smoke test that the tierdb storage extension attaches and merges a read.
+# group: [tierdb]
+
+require tierdb
+
+require-env TIERDB_TEST_DSN
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS pg (TYPE postgres);
+
+statement ok
+CALL postgres_execute('pg', 'TRUNCATE public.events; DELETE FROM tierdb.delta WHERE table_id = 90001; UPDATE tierdb.cutline SET tier_key_hi = 100 WHERE table_id = 90001; INSERT INTO public.events VALUES (2, 150, ''hot-seed'')');
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS tdb (TYPE tierdb);
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events ORDER BY id;
+----
+1	50	lake-1
+2	150	hot-seed
+4	80	lake-4-original
+
+query I
+SELECT count(*) FROM tdb.public.events;
+----
+3
