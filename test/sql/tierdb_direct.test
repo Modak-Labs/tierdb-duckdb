@@ -1,0 +1,147 @@
+# name: test/sql/tierdb_direct.test
+# description: Direct mode: cold DML commits straight to the lake through a live catalog, no delta buffer.
+# group: [tierdb]
+
+require tierdb
+
+require-env TIERDB_TEST_DSN
+
+require-env TIERDB_TEST_CATALOG
+
+require-env TIERDB_TEST_WAREHOUSE
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS pg (TYPE postgres);
+
+# Register table 90002 as direct against a live Lakekeeper catalog.
+statement ok
+CALL postgres_execute('pg', '
+    INSERT INTO tierdb.storage_profiles (profile_name, lake_format, warehouse, lake_config)
+    VALUES (''live_test'', ''iceberg'', ''${TIERDB_TEST_WAREHOUSE}'',
+            jsonb_build_object(''catalog.uri'', ''${TIERDB_TEST_CATALOG}''))
+    ON CONFLICT (profile_name) DO UPDATE
+        SET warehouse = EXCLUDED.warehouse, lake_config = EXCLUDED.lake_config;
+    DROP TABLE IF EXISTS public.events_direct;
+    CREATE TABLE public.events_direct (id bigint PRIMARY KEY, event_time bigint, val text);
+    DELETE FROM tierdb.cutline WHERE table_id = 90002;
+    DELETE FROM tierdb.tables WHERE table_id = 90002;
+    INSERT INTO tierdb.tables
+        (table_id, schema_name, table_name, primary_key_cols, tier_key_col,
+         tier_key_type, partition_scheme, lake_format, lake_table_ref, mode, storage_profile)
+    VALUES
+        (90002, ''public'', ''events_direct'', ARRAY[''id''], ''event_time'',
+         ''bigint'', ''{}''::jsonb, ''iceberg'', ''tierdb_direct.events'', ''direct'', ''live_test'');
+    INSERT INTO tierdb.cutline (table_id, tier_key_hi, lake_snapshot_id)
+    VALUES (90002, 100, 0);
+');
+
+# Create the live lake relation and seed one cold row.
+statement ok
+ATTACH '${TIERDB_TEST_WAREHOUSE}' AS ice (TYPE iceberg, ENDPOINT '${TIERDB_TEST_CATALOG}');
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS ice.tierdb_direct;
+
+statement ok
+DROP TABLE IF EXISTS ice.tierdb_direct.events;
+
+statement ok
+CREATE TABLE ice.tierdb_direct.events (id BIGINT, event_time BIGINT, val VARCHAR);
+
+statement ok
+INSERT INTO ice.tierdb_direct.events VALUES (1, 50, 'lake-1');
+
+statement ok
+ATTACH '${TIERDB_TEST_DSN}' AS tdb (TYPE tierdb);
+
+# Reads merge the heap with the live lake, no delta overlay.
+statement ok
+CALL postgres_execute('pg', 'INSERT INTO public.events_direct VALUES (10, 150, ''hot-row'')');
+
+query IIT
+SELECT id, event_time, val FROM tdb.public.events_direct ORDER BY id;
+----
+1	50	lake-1
+10	150	hot-row
+
+# INSERT: hot goes to the heap, cold commits straight to the lake.
+statement ok
+INSERT INTO tdb.public.events_direct VALUES (11, 160, 'hot-insert'), (12, 60, 'cold-insert');
+
+query I
+SELECT count(*) FROM pg.tierdb.delta WHERE table_id = 90002;
+----
+0
+
+query IIT
+SELECT id, event_time, val FROM ice.tierdb_direct.events ORDER BY id;
+----
+1	50	lake-1
+12	60	cold-insert
+
+query IIT
+SELECT id, event_time, val FROM pg.public.events_direct ORDER BY id;
+----
+10	150	hot-row
+11	160	hot-insert
+
+# Direct reads see the committed lake row immediately.
+query IIT
+SELECT id, event_time, val FROM tdb.public.events_direct ORDER BY id;
+----
+1	50	lake-1
+10	150	hot-row
+11	160	hot-insert
+12	60	cold-insert
+
+# UPDATE of a cold row rewrites it in the lake, upsert-by-pk.
+statement ok
+UPDATE tdb.public.events_direct SET val = 'cold-updated' WHERE id = 1;
+
+query IIT
+SELECT id, event_time, val FROM ice.tierdb_direct.events ORDER BY id;
+----
+1	50	cold-updated
+12	60	cold-insert
+
+query I
+SELECT count(*) FROM pg.tierdb.delta WHERE table_id = 90002;
+----
+0
+
+# DELETE of a cold row removes it from the lake, no tombstone anywhere.
+statement ok
+DELETE FROM tdb.public.events_direct WHERE id = 12;
+
+query IIT
+SELECT id, event_time, val FROM ice.tierdb_direct.events ORDER BY id;
+----
+1	50	cold-updated
+
+query I
+SELECT count(*) FROM pg.tierdb.delta WHERE table_id = 90002;
+----
+0
+
+# The retention guard fences the lake leg like it fences the delta leg.
+statement ok
+CALL postgres_execute('pg', 'UPDATE tierdb.cutline SET retention_line = 40 WHERE table_id = 90002');
+
+statement error
+INSERT INTO tdb.public.events_direct VALUES (13, 30, 'too-old');
+----
+below the retention line
+
+statement ok
+CALL postgres_execute('pg', 'UPDATE tierdb.cutline SET retention_line = NULL WHERE table_id = 90002');
+
+# Cleanup so reruns start fresh.
+statement ok
+DROP TABLE ice.tierdb_direct.events;
+
+statement ok
+CALL postgres_execute('pg', '
+    DELETE FROM tierdb.cutline WHERE table_id = 90002;
+    DELETE FROM tierdb.tables WHERE table_id = 90002;
+    DROP TABLE IF EXISTS public.events_direct;
+');

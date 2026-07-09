@@ -117,6 +117,7 @@ pub unsafe extern "C" fn tierdb_acquire_read_scan(
             serde_json::json!({
                 "pin_id": pinned.pin_id,
                 "scan_sql": pinned.scan_sql,
+                "attach_sql": pinned.attach_sql,
             })
             .to_string(),
         ),
@@ -197,7 +198,7 @@ pub unsafe extern "C" fn tierdb_insert_chunk(
         Err(e) => return TierDBStringResult::err(e),
     };
     match write::insert_chunk(conn, schema, table, rows_json) {
-        Ok(n) => TierDBStringResult::ok(n.to_string()),
+        Ok(outcome) => TierDBStringResult::ok(outcome.to_json()),
         Err(e) => TierDBStringResult::err(e),
     }
 }
@@ -228,7 +229,7 @@ pub unsafe extern "C" fn tierdb_delete_chunk(
         Err(e) => return TierDBStringResult::err(e),
     };
     match write::delete_chunk(conn, schema, table, rows_json) {
-        Ok(n) => TierDBStringResult::ok(n.to_string()),
+        Ok(outcome) => TierDBStringResult::ok(outcome.to_json()),
         Err(e) => TierDBStringResult::err(e),
     }
 }
@@ -259,7 +260,7 @@ pub unsafe extern "C" fn tierdb_update_chunk(
         Err(e) => return TierDBStringResult::err(e),
     };
     match write::update_chunk(conn, schema, table, rows_json) {
-        Ok(n) => TierDBStringResult::ok(n.to_string()),
+        Ok(outcome) => TierDBStringResult::ok(outcome.to_json()),
         Err(e) => TierDBStringResult::err(e),
     }
 }

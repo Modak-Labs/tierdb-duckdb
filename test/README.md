@@ -13,9 +13,14 @@ path, DML routing across the tier seam, and write atomicity.
 | `sql/tierdb_write.test` | INSERT/UPDATE/DELETE routing across the seam, retention-line rejection, mirrored mode heap-only writes. |
 | `sql/tierdb_txn.test`   | ROLLBACK discards, COMMIT is atomic, autocommit read-your-own-write. |
 | `sql/tierdb_types.test` | Column type round-trips (text, int, bool, double, numeric, uuid, date, timestamp, timestamptz, json, and `integer[]`/`text[]` arrays) through the heap and the delta overlay, on INSERT/UPDATE/DELETE. |
+| `sql/tierdb_direct.test` | Direct mode: cold INSERT/UPDATE/DELETE commit straight to the lake through a live catalog, live reads, retention guard, no delta rows. |
 
 The tests are gated on `TIERDB_TEST_DSN`; without it they are skipped, so a
 plain `make test` on a machine with no fixture stays green.
+`tierdb_direct.test` is additionally gated on `TIERDB_TEST_CATALOG` (a
+Lakekeeper REST endpoint, e.g. `http://localhost:8181/catalog`) and
+`TIERDB_TEST_WAREHOUSE` (a warehouse registered in it), since it needs a
+writable catalog; the example stack under `examples/` ships one.
 
 ## Running
 

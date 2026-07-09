@@ -7,6 +7,8 @@ struct TierDBConn;
 
 namespace duckdb {
 
+class ClientContext;
+
 struct TierDBColumn {
 	string name;
 	string pg_type;
@@ -35,6 +37,15 @@ struct TierDBPinnedScan {
 	bool has_pin;
 	int64_t pin_id;
 	string scan_sql;
+	string attach_sql;
+};
+
+// One DML chunk's row count plus the lake statements a direct-mode write
+// must execute before commit.
+struct TierDBDmlResult {
+	int64_t count;
+	string attach_sql;
+	vector<string> lake_sql;
 };
 
 class TierDBClient {
@@ -51,9 +62,9 @@ public:
 	void TxnBegin();
 	void TxnCommit();
 	void TxnRollback();
-	int64_t InsertChunk(const string &schema, const string &table, const string &rows_json);
-	int64_t DeleteChunk(const string &schema, const string &table, const string &rows_json);
-	int64_t UpdateChunk(const string &schema, const string &table, const string &rows_json);
+	TierDBDmlResult InsertChunk(const string &schema, const string &table, const string &rows_json);
+	TierDBDmlResult DeleteChunk(const string &schema, const string &table, const string &rows_json);
+	TierDBDmlResult UpdateChunk(const string &schema, const string &table, const string &rows_json);
 
 private:
 	::TierDBConn *conn;
@@ -61,5 +72,8 @@ private:
 };
 
 LogicalType TierDBLogicalTypeFromString(const string &duckdb_type);
+
+// Runs a direct-mode chunk's lake statements, attach first.
+void TierDBExecuteLakeDml(ClientContext &context, const TierDBDmlResult &dml);
 
 } // namespace duckdb

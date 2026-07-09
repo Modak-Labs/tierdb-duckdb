@@ -73,11 +73,12 @@ SinkResultType PhysicalTierDBUpdate::Sink(ExecutionContext &context, DataChunk &
 
 	auto &client = table.catalog.Cast<TierDBCatalog>().GetClient();
 	TierDBTransaction::Get(context.client, table.catalog).EnsureWriteTxn(client);
-	auto changed = client.UpdateChunk(table.tierdb_schema.schema_name, table.tierdb_schema.table_name, rows_json);
+	auto result = client.UpdateChunk(table.tierdb_schema.schema_name, table.tierdb_schema.table_name, rows_json);
+	TierDBExecuteLakeDml(context.client, result);
 
 	auto &gstate = input.global_state.Cast<TierDBUpdateGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
-	gstate.update_count += NumericCast<idx_t>(changed);
+	gstate.update_count += NumericCast<idx_t>(result.count);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 

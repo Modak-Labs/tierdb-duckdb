@@ -13,7 +13,7 @@ TierDBTransaction &TierDBTransaction::Get(ClientContext &context, Catalog &catal
 	return Transaction::Get(context, catalog).Cast<TierDBTransaction>();
 }
 
-string TierDBTransaction::GetPinnedScan(TierDBClient &client, const TierDBTableSchema &schema) {
+TierDBPinnedScan TierDBTransaction::GetPinnedScan(TierDBClient &client, const TierDBTableSchema &schema) {
 	lock_guard<mutex> guard(pin_lock);
 	auto it = scan_by_table.find(schema.table_id);
 	if (it != scan_by_table.end()) {
@@ -23,8 +23,8 @@ string TierDBTransaction::GetPinnedScan(TierDBClient &client, const TierDBTableS
 	if (pinned.has_pin) {
 		pins.push_back(pinned.pin_id);
 	}
-	scan_by_table.emplace(schema.table_id, pinned.scan_sql);
-	return pinned.scan_sql;
+	scan_by_table.emplace(schema.table_id, pinned);
+	return pinned;
 }
 
 void TierDBTransaction::ReleasePins(TierDBClient &client) {

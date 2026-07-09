@@ -65,11 +65,12 @@ SinkResultType PhysicalTierDBInsert::Sink(ExecutionContext &context, DataChunk &
 	auto rows_json = ChunkToJsonArray(chunk, column_names);
 	auto &client = table.catalog.Cast<TierDBCatalog>().GetClient();
 	TierDBTransaction::Get(context.client, table.catalog).EnsureWriteTxn(client);
-	auto written = client.InsertChunk(table.tierdb_schema.schema_name, table.tierdb_schema.table_name, rows_json);
+	auto result = client.InsertChunk(table.tierdb_schema.schema_name, table.tierdb_schema.table_name, rows_json);
+	TierDBExecuteLakeDml(context.client, result);
 
 	auto &gstate = input.global_state.Cast<TierDBInsertGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
-	gstate.insert_count += NumericCast<idx_t>(written);
+	gstate.insert_count += NumericCast<idx_t>(result.count);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 

@@ -25,6 +25,8 @@ unique_ptr<BaseStatistics> TierDBTableEntry::GetStatistics(ClientContext &contex
 
 struct TierDBScanBindData : public TableFunctionData {
 	string sql;
+	// Idempotent catalog ATTACH a direct-mode read runs before the scan.
+	string attach_sql;
 	vector<string> column_names;
 	// Routing virtual columns (see TierDBTableEntry::RoutingColumns) map back to
 	// the real heap column the merged read must project for them.
@@ -90,6 +92,12 @@ static unique_ptr<GlobalTableFunctionState> TierDBScanInitGlobal(ClientContext &
 	auto &bind_data = input.bind_data->Cast<TierDBScanBindData>();
 	auto state = make_uniq<TierDBScanGlobalState>();
 	state->connection = make_uniq<Connection>(*context.db);
+	if (!bind_data.attach_sql.empty()) {
+		auto attached = state->connection->Query(bind_data.attach_sql);
+		if (attached->HasError()) {
+			throw IOException("tierdb: lake catalog attach failed: %s", attached->GetError());
+		}
+	}
 	auto result = state->connection->Query(ProjectedScanSql(bind_data, input.column_ids));
 	if (result->HasError()) {
 		throw IOException("tierdb: merged read failed: %s", result->GetError());
@@ -112,7 +120,9 @@ TableFunction TierDBTableEntry::GetScanFunction(ClientContext &context, unique_p
 	auto &transaction = TierDBTransaction::Get(context, catalog);
 
 	auto data = make_uniq<TierDBScanBindData>();
-	data->sql = transaction.GetPinnedScan(tierdb_catalog.GetClient(), tierdb_schema);
+	auto pinned = transaction.GetPinnedScan(tierdb_catalog.GetClient(), tierdb_schema);
+	data->sql = pinned.scan_sql;
+	data->attach_sql = pinned.attach_sql;
 	for (auto &col : GetColumns().Physical()) {
 		data->column_names.push_back(col.Name());
 	}

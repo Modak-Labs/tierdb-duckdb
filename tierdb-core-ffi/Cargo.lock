@@ -582,7 +582,7 @@ dependencies = [
 [[package]]
 name = "tierdb-core"
 version = "0.1.0"
-source = "git+https://github.com/Modak-Labs/tierdb.git?branch=main#52f60e48a60a3285c67cb41e2dce6a99c2d8b352"
+source = "git+https://github.com/Modak-Labs/tierdb.git?tag=core-v0.1.0#11495df28c6eacfba704a4a66a2e6b64992e7b79"
 dependencies = [
  "thiserror",
 ]

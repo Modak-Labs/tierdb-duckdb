@@ -19,7 +19,8 @@ public:
 
 	// Returns the merged read for a table, acquiring and caching a read pin on
 	// first touch so every scan in this transaction reads the same frozen (T, S).
-	string GetPinnedScan(TierDBClient &client, const TierDBTableSchema &schema);
+	// Direct-mode tables carry an attach_sql instead of a pin.
+	TierDBPinnedScan GetPinnedScan(TierDBClient &client, const TierDBTableSchema &schema);
 
 	// Releases every pin this transaction acquired. Called at commit and rollback.
 	void ReleasePins(TierDBClient &client);
@@ -35,7 +36,7 @@ public:
 
 private:
 	mutex pin_lock;
-	unordered_map<int64_t, string> scan_by_table;
+	unordered_map<int64_t, TierDBPinnedScan> scan_by_table;
 	vector<int64_t> pins;
 	bool write_active = false;
 };

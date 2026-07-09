@@ -150,6 +150,7 @@ TierDBPinnedScan TierDBClient::AcquireReadScan(const string &schema, const strin
 	pinned.has_pin = pin_val && !yyjson_is_null(pin_val);
 	pinned.pin_id = pinned.has_pin ? yyjson_get_sint(pin_val) : 0;
 	pinned.scan_sql = ObjStr(root, "scan_sql");
+	pinned.attach_sql = ObjStr(root, "attach_sql");
 
 	yyjson_doc_free(doc);
 	tierdb_free_string(res.value);
@@ -208,52 +209,99 @@ void TierDBClient::TxnRollback() {
 	}
 }
 
-int64_t TierDBClient::InsertChunk(const string &schema, const string &table, const string &rows_json) {
+static TierDBDmlResult ParseDmlResult(TierDBStringResult res) {
+	if (res.err) {
+		string message = res.err;
+		tierdb_free_string(res.err);
+		throw IOException("tierdb: %s", message);
+	}
+	TierDBDmlResult result;
+	result.count = 0;
+	auto doc = yyjson_read(res.value, strlen(res.value), 0);
+	if (!doc) {
+		tierdb_free_string(res.value);
+		throw IOException("tierdb: could not parse DML result");
+	}
+	auto root = yyjson_doc_get_root(doc);
+	auto count_val = yyjson_obj_get(root, "count");
+	result.count = count_val ? yyjson_get_sint(count_val) : 0;
+	result.attach_sql = ObjStr(root, "attach_sql");
+	auto lake = yyjson_obj_get(root, "lake_sql");
+	if (lake) {
+		size_t idx, max;
+		yyjson_val *v;
+		yyjson_arr_foreach(lake, idx, max, v) {
+			auto str = yyjson_get_str(v);
+			if (str) {
+				result.lake_sql.emplace_back(str);
+			}
+		}
+	}
+	yyjson_doc_free(doc);
+	tierdb_free_string(res.value);
+	return result;
+}
+
+TierDBDmlResult TierDBClient::InsertChunk(const string &schema, const string &table, const string &rows_json) {
 	TierDBStringResult res;
 	{
 		lock_guard<mutex> guard(conn_lock);
 		res = tierdb_insert_chunk(conn, schema.c_str(), table.c_str(), rows_json.c_str());
 	}
-	if (res.err) {
-		string message = res.err;
-		tierdb_free_string(res.err);
-		throw IOException("tierdb: %s", message);
-	}
-	int64_t count = std::strtoll(res.value, nullptr, 10);
-	tierdb_free_string(res.value);
-	return count;
+	return ParseDmlResult(res);
 }
 
-int64_t TierDBClient::DeleteChunk(const string &schema, const string &table, const string &rows_json) {
+TierDBDmlResult TierDBClient::DeleteChunk(const string &schema, const string &table, const string &rows_json) {
 	TierDBStringResult res;
 	{
 		lock_guard<mutex> guard(conn_lock);
 		res = tierdb_delete_chunk(conn, schema.c_str(), table.c_str(), rows_json.c_str());
 	}
-	if (res.err) {
-		string message = res.err;
-		tierdb_free_string(res.err);
-		throw IOException("tierdb: %s", message);
-	}
-	int64_t count = std::strtoll(res.value, nullptr, 10);
-	tierdb_free_string(res.value);
-	return count;
+	return ParseDmlResult(res);
 }
 
-int64_t TierDBClient::UpdateChunk(const string &schema, const string &table, const string &rows_json) {
+TierDBDmlResult TierDBClient::UpdateChunk(const string &schema, const string &table, const string &rows_json) {
 	TierDBStringResult res;
 	{
 		lock_guard<mutex> guard(conn_lock);
 		res = tierdb_update_chunk(conn, schema.c_str(), table.c_str(), rows_json.c_str());
 	}
-	if (res.err) {
-		string message = res.err;
-		tierdb_free_string(res.err);
-		throw IOException("tierdb: %s", message);
+	return ParseDmlResult(res);
+}
+
+static void RunOnFreshConnection(ClientContext &context, const string &sql, const char *what) {
+	Connection con(*context.db);
+	auto result = con.Query(sql);
+	if (result->HasError()) {
+		throw IOException("tierdb: %s failed: %s", what, result->GetError());
 	}
-	int64_t count = std::strtoll(res.value, nullptr, 10);
-	tierdb_free_string(res.value);
-	return count;
+}
+
+void TierDBExecuteLakeDml(ClientContext &context, const TierDBDmlResult &dml) {
+	if (dml.lake_sql.empty()) {
+		return;
+	}
+	if (!dml.attach_sql.empty()) {
+		RunOnFreshConnection(context, dml.attach_sql, "lake catalog attach");
+	}
+	Connection con(*context.db);
+	for (auto &sql : dml.lake_sql) {
+		// Maintenance commits outside the advisory lock can still conflict;
+		// the statement failed whole, so a bounded retry is safe.
+		constexpr int max_attempts = 3;
+		for (int attempt = 1;; attempt++) {
+			auto result = con.Query(sql);
+			if (!result->HasError()) {
+				break;
+			}
+			auto error = result->GetError();
+			bool conflict = StringUtil::Contains(error, "409") || StringUtil::Contains(error, "Conflict") ||
+			                StringUtil::Contains(error, "CommitFailed");
+			if (!conflict || attempt >= max_attempts) {
+				throw IOException("tierdb: lake write failed: %s", error);
+			}
+		}
+	}
 }
 
 LogicalType TierDBLogicalTypeFromString(const string &duckdb_type) {

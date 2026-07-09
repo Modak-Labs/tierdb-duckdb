@@ -62,11 +62,12 @@ SinkResultType PhysicalTierDBDelete::Sink(ExecutionContext &context, DataChunk &
 	auto rows_json = KeysToJsonArray(chunk, key_indexes, key_names);
 	auto &client = table.catalog.Cast<TierDBCatalog>().GetClient();
 	TierDBTransaction::Get(context.client, table.catalog).EnsureWriteTxn(client);
-	auto removed = client.DeleteChunk(table.tierdb_schema.schema_name, table.tierdb_schema.table_name, rows_json);
+	auto result = client.DeleteChunk(table.tierdb_schema.schema_name, table.tierdb_schema.table_name, rows_json);
+	TierDBExecuteLakeDml(context.client, result);
 
 	auto &gstate = input.global_state.Cast<TierDBDeleteGlobalState>();
 	lock_guard<mutex> guard(gstate.lock);
-	gstate.delete_count += NumericCast<idx_t>(removed);
+	gstate.delete_count += NumericCast<idx_t>(result.count);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 

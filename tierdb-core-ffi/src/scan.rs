@@ -1,57 +1,34 @@
 use crate::catalog::{Conn, Cutline, TableSchema};
 use tierdb_core::dialect::DuckDbNative;
-use tierdb_core::domain::{TableId, TierKey};
+use tierdb_core::domain::TierKey;
+use tierdb_core::lake::LakeCatalog;
 use tierdb_core::sqlgen::{
-    read_pin_acquire_sql, read_pin_release_sql, render_scan, Column, LakePin, ReadCut, TableMeta,
-    READ_PIN_TTL_SECS,
+    read_pin_acquire_sql, read_pin_release_sql, render_scan, READ_PIN_TTL_SECS,
 };
-
-fn to_meta(s: &TableSchema) -> TableMeta {
-    TableMeta {
-        table_id: TableId(s.table_id as u32),
-        hot_schema: s.schema_name.clone(),
-        hot_table: s.table_name.clone(),
-        columns: s
-            .columns
-            .iter()
-            .map(|(name, sql_type)| Column {
-                name: name.clone(),
-                sql_type: sql_type.clone(),
-            })
-            .collect(),
-        pk_cols: s.primary_key_cols.clone(),
-        tier_key_col: s.tier_key_col.clone(),
-        tier_key_type: s.tier_key_type,
-    }
-}
 
 pub fn render_scan_sql(
     schema: &TableSchema,
     cutline: Option<&Cutline>,
     dsn: &str,
 ) -> Result<String, String> {
-    let meta = to_meta(schema);
-    let pin = match cutline {
-        Some(c) => LakePin::from_catalog_committed(
-            &schema.lake_format,
-            &c.lake_props,
-            Some(c.lake_snapshot_id),
-        )
-        .map_err(|e| e.to_string())?,
+    let table = schema.table(None)?;
+    let read = match cutline {
+        Some(c) => Some(
+            table
+                .scan(TierKey(c.tier_key_hi), Some(&c.lake_props))
+                .map_err(|e| e.to_string())?,
+        ),
         None => None,
     };
-    let cut = cutline.map(|c| ReadCut {
-        t: TierKey(c.tier_key_hi),
-        pin: pin.as_ref(),
-    });
-    render_scan(&meta, cut, &DuckDbNative { dsn }).map_err(|e| e.to_string())
+    render_scan(&table, read.as_ref(), &DuckDbNative { dsn }).map_err(|e| e.to_string())
 }
 
-/// A read pin plus the merged read rendered against the pinned `(T, S)`. A hot
-/// only table (no cut-line) needs no pin, so `pin_id` is `None`.
+/// A read pin plus the merged read rendered against it. Direct-mode reads
+/// also carry the `attach_sql` the caller must run first.
 pub struct PinnedScan {
     pub pin_id: Option<i64>,
     pub scan_sql: String,
+    pub attach_sql: Option<String>,
 }
 
 /// Freeze the table's cut-line, pin it, and render the merged read against that
@@ -60,6 +37,17 @@ pub struct PinnedScan {
 pub fn acquire_scan(conn: &mut Conn, schema: &str, table: &str) -> Result<PinnedScan, String> {
     let ts = conn.table_schema(schema, table)?;
     let dsn = conn.dsn.clone();
+    let lake = if ts.mode()?.is_direct() {
+        Some(conn.lake_catalog(&ts)?.ok_or_else(|| {
+            format!(
+                "direct table \"{}\".\"{}\" needs a live catalog endpoint, \
+                 but storage profile '{}' does not configure one",
+                ts.schema_name, ts.table_name, ts.storage_profile
+            )
+        })?)
+    } else {
+        None
+    };
 
     // A write transaction may already be open on this connection (a read after a
     // write in the same DuckDB transaction). Join it so we do not nest a `BEGIN`;
@@ -67,12 +55,12 @@ pub fn acquire_scan(conn: &mut Conn, schema: &str, table: &str) -> Result<Pinned
     // the cut-line and pin atomically under a short repeatable-read transaction so
     // the pin matches exactly what the scan reads.
     if conn.in_txn {
-        return pin_and_render(conn, &ts, &dsn);
+        return pin_and_render(conn, &ts, &dsn, lake);
     }
     conn.client
         .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         .map_err(|e| format!("read pin BEGIN failed: {e}"))?;
-    let pinned = pin_and_render(conn, &ts, &dsn);
+    let pinned = pin_and_render(conn, &ts, &dsn, lake);
     match &pinned {
         Ok(_) => conn
             .client
@@ -85,7 +73,12 @@ pub fn acquire_scan(conn: &mut Conn, schema: &str, table: &str) -> Result<Pinned
     pinned
 }
 
-fn pin_and_render(conn: &mut Conn, ts: &TableSchema, dsn: &str) -> Result<PinnedScan, String> {
+fn pin_and_render(
+    conn: &mut Conn,
+    ts: &TableSchema,
+    dsn: &str,
+    lake: Option<LakeCatalog>,
+) -> Result<PinnedScan, String> {
     let cutline = conn.cutline(ts.table_id)?;
     let pin_id = match &cutline {
         Some(c) => {
@@ -105,8 +98,25 @@ fn pin_and_render(conn: &mut Conn, ts: &TableSchema, dsn: &str) -> Result<Pinned
         }
         None => None,
     };
-    let scan_sql = render_scan_sql(ts, cutline.as_ref(), dsn)?;
-    Ok(PinnedScan { pin_id, scan_sql })
+
+    let attach_sql = lake.as_ref().map(|c| c.attach_sql());
+    let table = ts.table(lake)?;
+    let read = match &cutline {
+        Some(c) => Some(
+            table
+                .scan(TierKey(c.tier_key_hi), Some(&c.lake_props))
+                .map_err(|e| e.to_string())?,
+        ),
+        None => None,
+    };
+
+    let scan_sql =
+        render_scan(&table, read.as_ref(), &DuckDbNative { dsn }).map_err(|e| e.to_string())?;
+    Ok(PinnedScan {
+        pin_id,
+        scan_sql,
+        attach_sql,
+    })
 }
 
 pub fn release_pin(conn: &mut Conn, pin_id: i64) -> Result<(), String> {
@@ -141,6 +151,7 @@ mod tests {
             keep_heap: false,
             heap_retention_lag: None,
             lake_retention_lag: None,
+            storage_profile: "default".into(),
         }
     }
 
