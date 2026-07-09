@@ -1,4 +1,6 @@
-use crate::catalog::{Conn, Cutline, TableSchema};
+#[cfg(test)]
+use crate::catalog::Cutline;
+use crate::catalog::{Conn, TableSchema};
 use tierdb_core::dialect::DuckDbNative;
 use tierdb_core::domain::TierKey;
 use tierdb_core::lake::LakeCatalog;
@@ -6,7 +8,8 @@ use tierdb_core::sqlgen::{
     read_pin_acquire_sql, read_pin_release_sql, render_scan, READ_PIN_TTL_SECS,
 };
 
-pub fn render_scan_sql(
+#[cfg(test)]
+fn render_scan_sql(
     schema: &TableSchema,
     cutline: Option<&Cutline>,
     dsn: &str,
